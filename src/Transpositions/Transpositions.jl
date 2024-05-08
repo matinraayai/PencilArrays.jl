@@ -5,13 +5,16 @@ export transpose!  # to avoid needing to import LinearAlgebra in user code
 
 using TimerOutputs
 import MPI
-
+using GPUArrays
+using KernelAbstractions
+using KernelAbstractions: @index, @kernel
+using CUDA
 using ..PencilArrays
 using ..PencilArrays: typeof_ptr, typeof_array
 using ..Pencils: ArrayRegion
 using StaticPermutations
 using Strided: @strided, Strided, StridedView
-
+using NVTX
 # Declare transposition approaches.
 abstract type AbstractTransposeMethod end
 
@@ -562,23 +565,39 @@ function copy_range!(
     dest
 end
 
-# Generic case avoiding scalar indexing, should work for GPU arrays.
+@kernel function pack_kernel!(dest, src, nfast, nmid, nslow, offset)
+    idx = @index(Global)  
+    line_stride = nfast
+    plane_stride = nfast * nmid
+    if idx <= nmid * nslow
+        j = ((idx - 1) ÷ nfast) % nmid + 1
+        k = (idx - 1) ÷ (nfast * nmid) + 1
+        i = (idx - 1) % nfast + 1
+
+        src_idx = (j - 1) * line_stride + (k - 1) * plane_stride + i
+        dest_idx = offset + idx
+        @inbounds dest[dest_idx] = src[src_idx]
+   end
+end
+
 function copy_range!(
         dest::AbstractVector, dest_offset::Integer,
-        src::PencilArray, src_range_memorder::NTuple,
+        src::PencilArray, src_dims::NTuple
     )
-    exdims = extra_dims(src)
-    n = dest_offset
-    src_p = parent(src)  # array with non-permuted indices (memory order)
-    Ks = CartesianIndices(exdims)
-    Is = CartesianIndices(src_range_memorder)
-    len = length(Is) * length(Ks)
-    src_view = @view src_p[Is, Ks]
-    dst_view = @view dest[(n + 1):(n + len)]
-    # TODO this allocates on GPUArrays... can it be improved?
-    copyto!(dst_view, src_view)
-    dest
+    src_p = parent(src)
+    nfast, nmid, nslow = size(src_p)
+
+    total_elements = nfast * nmid * nslow
+    offset = dest_offset
+    backend = KernelAbstractions.get_backend(dest)
+    work_size = total_elements  
+
+    pack_kernel!(backend)(dest, src_p, nfast, nmid, nslow, offset, ndrange=(total_elements,))
+    KernelAbstractions.synchronize(backend)
+   
+    return dest
 end
+
 
 function copy_permuted!(
         dst::PencilArray, o_range_iperm::NTuple,
@@ -594,7 +613,7 @@ function copy_permuted!(
     src_dims = (map(length, o_range_iperm)..., exdims...)
     src_view = _viewreshape(src, src_dims, src_offset)
 
-    dst_inds = perm * o_range_iperm  # destination indices in memory order
+    dst_inds = perm * o_range_iperm  
     _permutedims!(dst, src_view, dst_inds, perm)
 
     dst
@@ -623,12 +642,12 @@ end
 function _permutedims!(dst::PencilArray, src, dst_inds, perm)
     exdims = extra_dims(dst)
     v = view(parent(dst), dst_inds..., map(Base.OneTo, exdims)...)
-    _permutedims!(typeof_array(pencil(dst)), v, src, perm)
+    _permutedims!(typeof_array(pencil(dst)), dst, v, src, perm)
 end
 
 # Specialisation for CPU arrays.
 # Note that v_in is the raw array (in memory order) wrapped by a PencilArray.
-function _permutedims!(::Type{Array}, v_in::SubArray, src, perm)
+function _permutedims!(::Type{Array}, dest, v_in::SubArray, src, perm)
     v = StridedView(v_in)
     vperm = if isidentity(perm)
         v
@@ -642,23 +661,79 @@ function _permutedims!(::Type{Array}, v_in::SubArray, src, perm)
     copyto!(vperm, src)
 end
 
-# General case, used in particular for GPU arrays.
-function _permutedims!(::Type{<:AbstractArray}, v::SubArray, src, perm)
-    if isidentity(perm)
-        copyto!(v, src)
-    else
-        E = ndims(v) - length(perm)  # number of "extra dims"
-        pperm = append(perm, Val(E))
-        # On GPUs, if `src` is an AbstractGPUArray, then there is a `permutedims!`
-        # implementation for GPUs (in GPUArrays.jl) if the destination is also
-        # an AbstractGPUArray.
-        # Note that AbstractGPUArray <: DenseArray, and `v` is generally not
-        # dense, so we need an intermediate array for the destination.
-        tmp = similar(src, pperm * size(src))  # TODO avoid allocation!
-        permutedims!(tmp, src, Tuple(pperm))
-        copyto!(v, tmp)
+
+@kernel function permutedim_kernel!(src, dest, ::Val{(1, 2, 3)}, nfast, nmid, nslow)
+    idx = @index(Global)
+    if idx > nfast * nmid * nslow
+        nothing
     end
-    v
+    i = (idx - 1) % nfast + 1
+    j = ((idx - 1) ÷ nfast) % nmid + 1
+    k = (idx - 1) ÷ (nfast * nmid) + 1
+    @inbounds dest[i, j, k] = src[i, j, k]
 end
 
+@kernel function permutedim_kernel!(src, dest, ::Val{(1, 3, 2)}, nfast, nmid, nslow)
+    idx = @index(Global)
+    if idx > nfast * nmid * nslow
+        nothing
+    end
+    i = (idx - 1) % nfast + 1
+    k = ((idx - 1) ÷ nfast) % nmid + 1
+    j = (idx - 1) ÷ (nfast * nmid) + 1
+    @inbounds dest[i, k, j] = src[i, j, k]
+end
+
+@kernel function permutedim_kernel!(src, dest, ::Val{(2, 1, 3)}, nfast, nmid, nslow)
+    idx = @index(Global)
+    if idx > nfast * nmid * nslow
+        nothing
+    end
+    j = (idx - 1) % nfast + 1
+    i = ((idx - 1) ÷ nfast) % nmid + 1
+    k = (idx - 1) ÷ (nfast * nmid) + 1
+    @inbounds dest[j, i, k] = src[i, j, k]
+end
+
+@kernel function permutedim_kernel!(src, dest, ::Val{(2, 3, 1)}, nfast, nmid, nslow)
+    idx = @index(Global)
+    if idx > nfast * nmid * nslow
+        nothing
+    end
+    j = (idx - 1) % nfast + 1
+    k = ((idx - 1) ÷ nfast) % nmid + 1
+    i = (idx - 1) ÷ (nfast * nmid) + 1
+    @inbounds dest[j, k, i] = src[i, j, k]
+end
+
+@kernel function permutedim_kernel!(src, dest, ::Val{(3, 1, 2)}, nfast, nmid, nslow)
+    idx = @index(Global)
+    if idx > nfast * nmid * nslow
+        nothing
+    end
+    k = (idx - 1) % nfast + 1
+    i = ((idx - 1) ÷ nfast) % nmid + 1
+    j = (idx - 1) ÷ (nfast * nmid) + 1
+    @inbounds dest[k, i, j] = src[i, j, k]
+end
+
+
+# General case, used in particular for GPU arrays.
+function _permutedims!(::Type{<:AbstractGPUArray}, dest::PencilArray, v::SubArray, src, perm)
+    if isidentity(perm)
+        copyto!(v, src)
+    elseE = ndims(v) - length(perm)  # number of "extra dims"
+    pperm = append(perm, Val(E))
+    dest_p = parent(dest)
+    nfast, nmid, nslow = size(dest_p)
+
+    total_elements = nfast * nmid * nslow
+    work_size = total_elements  
+    backend = KernelAbstractions.get_backend(src)
+
+    unpack_kernel!(backend)(src, v, Val(Tuple(pperm)), nfast, nmid, nslow, ndrange=size(src))
+    KernelAbstractions.synchronize(backend)
+    end
+   v
+end
 end  # module Transpositions
