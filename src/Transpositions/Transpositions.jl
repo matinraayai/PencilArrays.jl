@@ -89,7 +89,7 @@ struct Transposition{T, N,
     recv_buf:: AbstractVector{T}
     length_send :: Int
     length_recv_total:: Int
-    length_self:: Int
+    #length_self:: Int
 
     function Transposition(Ao::PencilArray{T,N}, Ai::PencilArray{T,N};
                            method = PointToPoint()) where {T,N}
@@ -129,8 +129,6 @@ struct Transposition{T, N,
 
         new{T, N, typeof(Pi), typeof(Po), typeof(Ai), typeof(Ao), typeof(method)}(Pi, Po, Ai, Ao, method, dim, reqs, send_buf, recv_buf, length_send, length_recv_total)
 
-       # new{T, N, typeof(Pi), typeof(Po), typeof(Ai), typeof(Ao)
-        #    typeof(method)}(Pi, Po, Ai, Ao, method, dim, reqs)
     end
 end
 """
