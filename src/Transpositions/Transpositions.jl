@@ -85,6 +85,11 @@ struct Transposition{T, N,
     method :: M
     dim :: Union{Nothing,Int}  # dimension along which transposition is performed
     send_requests :: MPI.RequestSet
+    send_buf:: AbstractVector{T} 
+    recv_buf:: AbstractVector{T}
+    length_send :: Int
+    length_recv_total:: Int
+    length_self:: Int
 
     function Transposition(Ao::PencilArray{T,N}, Ai::PencilArray{T,N};
                            method = PointToPoint()) where {T,N}
@@ -107,11 +112,27 @@ struct Transposition{T, N,
 
         reqs = MPI.RequestSet()
 
-        new{T, N, typeof(Pi), typeof(Po), typeof(Ai), typeof(Ao),
-            typeof(method)}(Pi, Po, Ai, Ao, method, dim, reqs)
+        length_self = let
+            range_intersect = map(intersect, Pi.axes_local, Po.axes_local)
+            prod(map(length, range_intersect)) * prod(extra_dims(Ai))
+        end
+    
+    
+        length_send = length(Ai) - length_self
+        length_recv_total = length(Ao)
+        backend = get_backend(Ai)
+
+        send_buf = KernelAbstractions.zeros(backend, T, length_send)
+        recv_buf = KernelAbstractions.zeros(backend, T, length_recv_total)
+      # @show sizeof(send_buf), sizeof(recv_buf)
+      @assert length(send_buf) >= length_send && length(recv_buf) >= length_recv_total
+
+        new{T, N, typeof(Pi), typeof(Po), typeof(Ai), typeof(Ao), typeof(method)}(Pi, Po, Ai, Ao, method, dim, reqs, send_buf, recv_buf, length_send, length_recv_total)
+
+       # new{T, N, typeof(Pi), typeof(Po), typeof(Ai), typeof(Ao)
+        #    typeof(method)}(Pi, Po, Ai, Ao, method, dim, reqs)
     end
 end
-
 """
     MPI.Waitall(t::Transposition)
 
@@ -292,24 +313,18 @@ function transpose_impl!(R::Int, t::Transposition{T}) where {T}
 
     remote_inds = get_remote_indices(R, topology.coords_local, Nproc)
 
-    # Length of data that I will "send" to myself.
+
     length_self = let
         range_intersect = map(intersect, Pi.axes_local, Po.axes_local)
         prod(map(length, range_intersect)) * prod(extra_dims(Ai))
     end
-
-    # Total data to be sent / received.
     length_send = length(Ai) - length_self
-    length_recv_total = length(Ao)  # includes local exchange with myself
-
-    # Minimum resize is one in order to have a valid pointer
-    # in the case of a CuArray for instance
-    resize!(Po.send_buf, sizeof(T) * max(1, length_send))
-    send_buf = unsafe_as_array(T, Po.send_buf, length_send)
-
-    resize!(Po.recv_buf, sizeof(T) * max(1, length_recv_total))
-    recv_buf = unsafe_as_array(T, Po.recv_buf, length_recv_total)
-    recv_offsets = Vector{Int}(undef, Nproc)  # all offsets in recv_buf
+    length_recv_total = length(Ao)
+    # @show sizeof(send_buf), sizeof(recv_buf)
+    send_buf = t.send_buf
+    recv_buf = t.recv_buf
+    recv_offsets = Vector{Int}(undef, Nproc) 
+    @assert length(send_buf) >= length_send && length(recv_buf) >= length_recv_total
 
     req_length = method === Alltoallv() ? 0 : Nproc
     send_req = t.send_requests :: MPI.RequestSet
@@ -320,7 +335,7 @@ function transpose_impl!(R::Int, t::Transposition{T}) where {T}
     @assert length(send_req) == length(recv_req) == req_length
 
     buffers = (send_buf, recv_buf)
-
+  #  @show sizeof(send_buf), sizeof(recv_buf)
     # We use RequestSet to avoid some allocations
     requests = (send_req, recv_req)
 
@@ -593,12 +608,28 @@ function copy_range!(
     work_size = total_elements  
 
     pack_kernel!(backend)(dest, src_p, nfast, nmid, nslow, offset, ndrange=(total_elements,))
-    KernelAbstractions.synchronize(backend)
+#    KernelAbstractions.synchronize(backend)
    
     return dest
 end
-
-
+"""
+function copy_range!(
+        dest::AbstractVector, dest_offset::Integer,
+        src::PencilArray, src_range_memorder::NTuple,
+    )
+    exdims = extra_dims(src)
+    n = dest_offset
+    src_p = parent(src)  # array with non-permuted indices (memory order)
+    Ks = CartesianIndices(exdims)
+    Is = CartesianIndices(src_range_memorder)
+    len = length(Is) * length(Ks)
+    src_view = @view src_p[Is, Ks]
+    dst_view = @view dest[(n + 1):(n + len)]
+    # TODO this allocates on GPUArrays... can it be improved?
+    copyto!(dst_view, src_view)
+    dest
+end
+"""
 function copy_permuted!(
         dst::PencilArray, o_range_iperm::NTuple,
         src::AbstractVector, src_offset::Integer,
@@ -661,8 +692,7 @@ function _permutedims!(::Type{Array}, dest, v_in::SubArray, src, perm)
     copyto!(vperm, src)
 end
 
-
-@kernel function permutedim_kernel!(src, dest, ::Val{(1, 2, 3)}, nfast, nmid, nslow)
+@kernel function unpack_kernel!(src, dest, ::Val{(1, 2, 3)}, nfast, nmid, nslow)
     idx = @index(Global)
     if idx > nfast * nmid * nslow
         nothing
@@ -673,7 +703,7 @@ end
     @inbounds dest[i, j, k] = src[i, j, k]
 end
 
-@kernel function permutedim_kernel!(src, dest, ::Val{(1, 3, 2)}, nfast, nmid, nslow)
+@kernel function unpack_kernel!(src, dest, ::Val{(1, 3, 2)}, nfast, nmid, nslow)
     idx = @index(Global)
     if idx > nfast * nmid * nslow
         nothing
@@ -684,7 +714,7 @@ end
     @inbounds dest[i, k, j] = src[i, j, k]
 end
 
-@kernel function permutedim_kernel!(src, dest, ::Val{(2, 1, 3)}, nfast, nmid, nslow)
+@kernel function unpack_kernel!(src, dest, ::Val{(2, 1, 3)}, nfast, nmid, nslow)
     idx = @index(Global)
     if idx > nfast * nmid * nslow
         nothing
@@ -695,7 +725,7 @@ end
     @inbounds dest[j, i, k] = src[i, j, k]
 end
 
-@kernel function permutedim_kernel!(src, dest, ::Val{(2, 3, 1)}, nfast, nmid, nslow)
+@kernel function unpack_kernel!(src, dest, ::Val{(2, 3, 1)}, nfast, nmid, nslow)
     idx = @index(Global)
     if idx > nfast * nmid * nslow
         nothing
@@ -706,7 +736,7 @@ end
     @inbounds dest[j, k, i] = src[i, j, k]
 end
 
-@kernel function permutedim_kernel!(src, dest, ::Val{(3, 1, 2)}, nfast, nmid, nslow)
+@kernel function unpack_kernel!(src, dest, ::Val{(3, 1, 2)}, nfast, nmid, nslow)
     idx = @index(Global)
     if idx > nfast * nmid * nslow
         nothing
@@ -736,4 +766,5 @@ function _permutedims!(::Type{<:AbstractGPUArray}, dest::PencilArray, v::SubArra
     end
    v
 end
+
 end  # module Transpositions
